@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDConvert — Files to Markdown</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<!-- Theme Toggle -->
+<button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
+    <svg class="sun-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="5"/>
+        <line x1="12" y1="1" x2="12" y2="3"/>
+        <line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1" y1="12" x2="3" y2="12"/>
+        <line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+    </svg>
+    <svg class="moon-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+    </svg>
+</button>
+
+<!-- LANDING PAGE -->
+<section class="page active" id="landingPage">
+    <div class="landing-inner">
+        <div class="logo-mark">MD</div>
+        <h1 class="landing-title">Everything<br>becomes markdown.</h1>
+        <p class="landing-sub">Drop a PDF. Paste a URL. Type raw text.<br>Get clean markdown — optimised for LLMs.</p>
+        <button class="start-btn" id="startBtn">
+            Start converting
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="5" y1="12" x2="19" y2="12"/>
+                <polyline points="12 5 19 12 12 19"/>
+            </svg>
+        </button>
+        <div class="landing-pills">
+            <span class="pill">PDF</span>
+            <span class="pill">DOCX</span>
+            <span class="pill">PPTX</span>
+            <span class="pill">Images</span>
+            <span class="pill">URLs</span>
+            <span class="pill">YouTube</span>
+            <span class="pill">Plain text</span>
+        </div>
+    </div>
+</section>
+
+<!-- CONVERTER PAGE -->
+<section class="page" id="converterPage">
+    <div class="converter-grid">
+
+        <!-- LEFT: Carousel input -->
+        <div class="input-col">
+
+            <div class="slide-label-row">
+                <span class="slide-label" id="slideLabel">Upload a file</span>
+                <span class="slide-counter"><span id="slideNum">1</span> / 4</span>
+            </div>
+
+            <!-- Slides wrapper -->
+            <div class="carousel-track" id="carouselTrack">
+
+                <!-- Slide 1: File -->
+                <div class="slide active" id="slide-0">
+                    <div class="drop-zone" id="fileDropZone">
+                        <input type="file" id="fileInput" style="display:none" accept=".pdf,.docx,.pptx,.xlsx,.html,.txt">
+                        <div class="drop-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                        </div>
+                        <p class="drop-main">Drag a non-image file here</p>
+                        <p class="drop-sub">or <span class="drop-link">browse your files</span></p>
+                        <p class="drop-types">PDF · DOCX · PPTX · XLSX · HTML · TXT</p>
+                    </div>
+                </div>
+
+                <!-- Slide 2: Image -->
+                <div class="slide" id="slide-1">
+                    <div class="drop-zone" id="imageDropZone">
+                        <input type="file" id="imageFileInput" style="display:none" accept=".png,.jpg,.jpeg,.gif,.webp">
+                        <div class="drop-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                        </div>
+                        <p class="drop-main">Drag an image here</p>
+                        <p class="drop-sub">or <span class="drop-link">browse your images</span></p>
+                        <p class="drop-types">PNG · JPG · GIF · WEBP</p>
+                    </div>
+                </div>
+
+                <!-- Slide 3: URL -->
+                <div class="slide" id="slide-2">
+                    <div class="url-slide">
+                        <p class="slide-hint">Paste any URL — article, Wikipedia page, YouTube link…</p>
+                        <input type="text" id="urlInput" class="text-input" placeholder="https://en.wikipedia.org/wiki/…">
+                        <button class="convert-btn" id="convertUrlBtn">Convert URL</button>
+                    </div>
+                </div>
+
+                <!-- Slide 4: Text -->
+                <div class="slide" id="slide-3">
+                    <div class="text-slide">
+                        <p class="slide-hint">Paste raw text — Claude will clean and structure it as markdown.</p>
+                        <textarea id="textInput" class="text-area" placeholder="Paste your text here…"></textarea>
+                        <button class="convert-btn" id="convertTextBtn">Convert Text</button>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Carousel nav -->
+            <div class="carousel-nav">
+                <button class="nav-arrow" id="prevBtn" aria-label="Previous">&#8592;</button>
+                <div class="dot-row">
+                    <button class="dot active" data-idx="0"></button>
+                    <button class="dot" data-idx="1"></button>
+                    <button class="dot" data-idx="2"></button>
+                    <button class="dot" data-idx="3"></button>
+                </div>
+                <button class="nav-arrow" id="nextBtn" aria-label="Next">&#8594;</button>
+            </div>
+
+            <!-- Status -->
+            <div class="msg" id="statusMsg" style="display:none"></div>
+            <div class="msg error" id="errorMsg" style="display:none"></div>
+        </div>
+
+        <!-- RIGHT: Output -->
+        <div class="output-col">
+            <div class="output-header">
+                <span class="output-label">Markdown output</span>
+                <div class="output-actions">
+                    <button class="action-btn" id="copyBtn" style="display:none">Copy</button>
+                    <button class="action-btn" id="downloadBtn" style="display:none">Download .md</button>
+                    <button class="action-btn" id="githubBtn" style="display:none">Push to GitHub</button>
+                    <button class="action-btn ghost" id="clearBtn" style="display:none">Clear</button>
+                </div>
+            </div>
+            <textarea class="output-area" id="markdownOutput" readonly placeholder="Your converted markdown will appear here…"></textarea>
+            <div class="copy-toast" id="copyToast">Copied!</div>
+
+            <!-- Filename input, shown once there's output -->
+            <div class="filename-row" id="filenameRow" style="display:none">
+                <input type="text" id="filenameInput" class="text-input filename-input" value="converted.md" placeholder="filename.md">
+            </div>
+
+            <!-- GitHub push result -->
+            <div class="github-result" id="githubResult" style="display:none">
+                <span class="output-label small">File URL</span>
+                <div class="url-row">
+                    <input type="text" id="githubUrlOutput" class="text-input" readonly>
+                    <button class="action-btn" id="copyGithubUrlBtn">Copy URL</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <button class="back-btn" id="backBtn">&#8592; Back</button>
+</section>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
