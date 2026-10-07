@@ -54,15 +54,38 @@ themeToggle.addEventListener('click', () => {
     localStorage.setItem('theme', next);
 });
 
+function navigatePage(fromEl, toEl, direction = 1) {
+    // Ensure both are visible for transition
+    fromEl.classList.add('active');
+    toEl.classList.add('active');
+
+    // Set exit/enter classes based on direction
+    // direction > 0: forward (left to right)
+    // direction < 0: backward (right to left)
+    if (direction > 0) {
+        // Going forward: exit left, enter from right
+        fromEl.classList.add('exit-left');
+        toEl.classList.add('enter-right');
+    } else {
+        // Going backward: exit right, enter from left
+        fromEl.classList.add('exit-right');
+        toEl.classList.add('enter-left');
+    }
+
+    // Wait for transition end
+    setTimeout(() => {
+        fromEl.classList.remove('active', 'exit-left', 'exit-right');
+        toEl.classList.remove('enter-left', 'enter-right');
+    }, 500);
+}
+
 /* ─── PAGE NAV ───────────────────────────────────── */
 startBtn.addEventListener('click', () => {
-    landingPage.classList.remove('active');
-    converterPage.classList.add('active');
+    navigatePage(landingPage, converterPage, 1); // forward
 });
 
 backBtn.addEventListener('click', () => {
-    converterPage.classList.remove('active');
-    landingPage.classList.add('active');
+    navigatePage(converterPage, landingPage, -1); // backward
 });
 
 /* ─── CAROUSEL ───────────────────────────────────── */
@@ -117,7 +140,9 @@ fileDropZone.addEventListener('dragover', e => {
     e.preventDefault();
     fileDropZone.classList.add('over');
 });
+
 fileDropZone.addEventListener('dragleave', () => fileDropZone.classList.remove('over'));
+
 fileDropZone.addEventListener('drop', e => {
     e.preventDefault();
     fileDropZone.classList.remove('over');
@@ -136,7 +161,9 @@ imageDropZone.addEventListener('dragover', e => {
     e.preventDefault();
     imageDropZone.classList.add('over');
 });
+
 imageDropZone.addEventListener('dragleave', () => imageDropZone.classList.remove('over'));
+
 imageDropZone.addEventListener('drop', e => {
     e.preventDefault();
     imageDropZone.classList.remove('over');
