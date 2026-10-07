@@ -218,28 +218,45 @@ def convert_image():
     try:
         file.save(image_path)
 
-        metadata = get_image_metadata(image_path)
-        ocr_text = ocr_image(image_path)
+        # Try to use markitdown with OCR plugin (vision LLM) if available
+        markdown_from_markitdown = ''
+        try:
+            # Convert the image to markdown using markitdown (which may use vision LLM via markitdown_ocr plugin)
+            result = md.convert(image_path)
+            markdown_from_markitdown = result.text_content.strip()
+        except Exception as e:
+            print(f'Markitdown conversion failed: {e}')
+            markdown_from_markitdown = ''
 
-        with open(image_path, 'rb') as f:
-            image_bytes = f.read()
+        # If markitdown gave us useful content, use it
+        if markdown_from_markitdown:
+            # We can optionally append metadata, but the vision description might be sufficient
+            metadata = get_image_metadata(image_path)
+            markdown_output = f'{markdown_from_markitdown}\n\n---\n*Image Information:*\n- Filename: {original_filename}\n- {metadata}'
+        else:
+            # Fallback to original OCR-based processing
+            metadata = get_image_metadata(image_path)
+            ocr_text = ocr_image(image_path)
 
-        ext = suffix.lstrip('.').lower()
-        content_type = CONTENT_TYPE_MAP.get(ext, 'image/png')
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
 
-        # Describe the image ONCE here so the markdown is self-contained.
-        # Returns None if too small / no API key / failed.
-        description = describe_image(image_bytes, content_type)
+            ext = suffix.lstrip('.').lower()
+            content_type = CONTENT_TYPE_MAP.get(ext, 'image/png')
 
-        markdown_output = (
-            f"Image Information:\n"
-            f"- Filename: {original_filename}\n"
-            f"- {metadata}"
-        )
-        if ocr_text:
-            markdown_output += f"\n\n## Extracted Text\n{ocr_text}"
-        if description:
-            markdown_output += f"\n\n## Description\n{description}"
+            # Describe the image ONCE here so the markdown is self-contained.
+            # Returns None if too small / no API key / failed.
+            description = describe_image(image_bytes, content_type)
+
+            markdown_output = (
+                f'Image Information:\n'
+                f'- Filename: {original_filename}\n'
+                f'- {metadata}'
+            )
+            if ocr_text:
+                markdown_output += f'\\n\\n## Extracted Text\\n{ocr_text}'
+            if description:
+                markdown_output += f'\\n\\n## Description\\n{description}'
 
         images_payload = [{
             'filename': original_filename,
