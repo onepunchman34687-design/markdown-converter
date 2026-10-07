@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import time
 import base64
@@ -7,19 +8,42 @@ from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 import yt_dlp
 from flask import Flask, request, jsonify, render_template
 from markitdown import MarkItDown
-from markitdown_ocr import register_converters
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageOps
 from image_extract import extract_images
 from image_describe import describe_image
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    import pymupdf4llm
+except ImportError:
+    pymupdf4llm = None
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
 md = MarkItDown()
-register_converters(md)
+
+# Optional plugin: don't crash the whole app if it is missing or misconfigured
+try:
+    from markitdown_ocr import register_converters
+    register_converters(md)
+except Exception as e:
+    print(f"markitdown_ocr not registered: {e}")
+
+# Windows: find Tesseract even if it is not on PATH
+_WIN_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if pytesseract and not shutil.which("tesseract") and os.path.exists(_WIN_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = _WIN_TESSERACT
+
+MAX_OCR_PAGES = int(os.environ.get('MAX_OCR_PAGES', '30'))
+_rapid_engine = None
 
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
@@ -42,6 +66,80 @@ def get_image_metadata(file_path):
     except Exception as e:
         return f"Could not get image metadata: {str(e)}"
 
+# ---------------------------------------------------------------- OCR helpers
+
+def _ocr_pil(img):
+    """OCR a PIL image. Tries Tesseract first, then RapidOCR. Returns '' if neither works."""
+    global _rapid_engine
+    img = ImageOps.exif_transpose(img)
+    img = ImageOps.grayscale(img)
+    if img.width < 1500:
+        img = img.resize((img.width * 2, img.height * 2))
+
+    if pytesseract:
+        try:
+            return pytesseract.image_to_string(img, config="--psm 6").strip()
+        except Exception as e:
+            print(f"Tesseract OCR failed, trying RapidOCR: {e}")
+
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+        if _rapid_engine is None:
+            _rapid_engine = RapidOCR()
+        result, _ = _rapid_engine(np.array(img))
+        return "\n".join(line[1] for line in result) if result else ""
+    except Exception as e:
+        print(f"RapidOCR failed: {e}")
+        return ""
+
+def ocr_image(path):
+    try:
+        with Image.open(path) as img:
+            return _ocr_pil(img.convert("RGB"))
+    except Exception as e:
+        print(f"OCR failed for {path}: {e}")
+        return ""
+
+# ---------------------------------------------------------------- PDF helpers
+
+def convert_pdf_fast(path):
+    """Fast text-layer extraction with PyMuPDF. Returns '' if unavailable or the PDF looks scanned."""
+    if pymupdf4llm is None:
+        return ''
+    try:
+        import fitz
+        with fitz.open(path) as doc:
+            pages = max(len(doc), 1)
+        text = pymupdf4llm.to_markdown(path)
+    except Exception as e:
+        print(f"Fast PDF path failed: {e}")
+        return ''
+    # Fewer than ~50 characters per page means there is no real text layer
+    return text if len(text.strip()) / pages >= 50 else ''
+
+def ocr_pdf(path):
+    """OCR a scanned PDF page by page (capped by MAX_OCR_PAGES). Returns '' if OCR is unavailable."""
+    try:
+        import fitz
+        parts = []
+        with fitz.open(path) as doc:
+            total = len(doc)
+            for i in range(min(total, MAX_OCR_PAGES)):
+                pix = doc[i].get_pixmap(dpi=200)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                text = _ocr_pil(img)
+                if text:
+                    parts.append(f"## Page {i + 1}\n\n{text}")
+        if not parts:
+            return ''
+        if total > MAX_OCR_PAGES:
+            parts.append(f"_OCR stopped after {MAX_OCR_PAGES} of {total} pages._")
+        return "\n\n".join(parts)
+    except Exception as e:
+        print(f"PDF OCR failed: {e}")
+        return ''
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -56,15 +154,24 @@ def convert_file():
         return jsonify({'error': 'No file selected'}), 400
 
     suffix = os.path.splitext(file.filename)[1] or '.tmp'
+    # Image descriptions call a vision API once per image: slow, so opt-in
+    describe = request.form.get('describe') == '1'
 
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file.save(tmp.name)
-            result = md.convert(tmp.name)
-            # Pull any embedded pictures out of PDFs / DOCX / PPTX as real image bytes
-            # (no OCR, no LLM — just reading the file's internal structure directly)
-            embedded_images = extract_images(tmp.name, suffix)
-        os.unlink(tmp.name)
+        file.save(tmp_path)
+
+        markdown_text = ''
+        if suffix.lower() == '.pdf':
+            markdown_text = convert_pdf_fast(tmp_path)        # text PDFs: fast
+            if not markdown_text:
+                markdown_text = ocr_pdf(tmp_path)             # scanned PDFs: local OCR
+        if not markdown_text:
+            markdown_text = md.convert(tmp_path).text_content # everything else / last resort
+
+        # Pull any embedded pictures out of PDFs / DOCX / PPTX as real image bytes
+        embedded_images = extract_images(tmp_path, suffix, describe=describe)
 
         images_payload = [
             {
@@ -76,7 +183,6 @@ def convert_file():
             for img in embedded_images
         ]
 
-        markdown_text = result.text_content
         described = [img for img in embedded_images if img.get('description')]
         if described:
             markdown_text += "\n\n## Embedded Image Descriptions\n"
@@ -86,6 +192,11 @@ def convert_file():
         return jsonify({'markdown': markdown_text, 'images': images_payload})
     except Exception as e:
         return jsonify({'error': f'Conversion failed: {str(e)}'}), 500
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 @app.route('/api/convert-image', methods=['POST'])
 def convert_image():
@@ -102,35 +213,31 @@ def convert_image():
     original_filename = secure_filename(file.filename)
     suffix = os.path.splitext(original_filename)[1] or '.tmp'
 
+    fd, image_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file.save(tmp.name)
-            image_path = tmp.name
+        file.save(image_path)
 
         metadata = get_image_metadata(image_path)
+        ocr_text = ocr_image(image_path)
 
         with open(image_path, 'rb') as f:
             image_bytes = f.read()
 
-        os.unlink(image_path)
-
         ext = suffix.lstrip('.').lower()
         content_type = CONTENT_TYPE_MAP.get(ext, 'image/png')
 
-        # Describe the image ONCE here so the markdown is self-contained —
-        # a text-only LLM reading the pushed .md later gets real content,
-        # not just dimensions. Returns None if too small / no API key / failed,
-        # in which case we fall back to metadata-only (old behavior).
+        # Describe the image ONCE here so the markdown is self-contained.
+        # Returns None if too small / no API key / failed.
         description = describe_image(image_bytes, content_type)
 
-        # The markdown preview just shows metadata for now — the actual
-        # ![image](url) embed gets stitched in once the real image is
-        # pushed to GitHub and we know its real raw URL (see /api/push-to-github).
         markdown_output = (
             f"Image Information:\n"
             f"- Filename: {original_filename}\n"
             f"- {metadata}"
         )
+        if ocr_text:
+            markdown_output += f"\n\n## Extracted Text\n{ocr_text}"
         if description:
             markdown_output += f"\n\n## Description\n{description}"
 
@@ -144,6 +251,11 @@ def convert_image():
 
     except Exception as e:
         return jsonify({'error': f'Image conversion failed: {str(e)}'}), 500
+    finally:
+        try:
+            os.unlink(image_path)
+        except OSError:
+            pass
 
 @app.route('/api/convert-url', methods=['POST'])
 def convert_url():
