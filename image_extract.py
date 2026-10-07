@@ -42,7 +42,7 @@ def extract_images(file_path, suffix, describe=True):
         return []
 
     for img in images:
-	if not describe:
+        if not describe:
             img['description'] = None
             continue
         if _is_too_small(img['data']):

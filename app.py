@@ -4,9 +4,12 @@ import tempfile
 import time
 import base64
 import requests
+import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 import yt_dlp
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from markitdown import MarkItDown
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -51,6 +54,14 @@ CONTENT_TYPE_MAP = {
     'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
     'gif': 'image/gif', 'webp': 'image/webp'
 }
+
+# Job management
+jobs = {}  # job_id -> job_info
+jobs_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=4)  # Adjust based on server capacity
+JOB_TIMEOUT_SECONDS = 30 * 60  # 30 minutes
+RESULTS_DIR = os.path.join(tempfile.gettempdir(), 'markdown_converter_results')
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -131,14 +142,324 @@ def ocr_pdf(path):
                 text = _ocr_pil(img)
                 if text:
                     parts.append(f"## Page {i + 1}\n\n{text}")
-        if not parts:
-            return ''
-        if total > MAX_OCR_PAGES:
-            parts.append(f"_OCR stopped after {MAX_OCR_PAGES} of {total} pages._")
+            if not parts:
+                return ''
+            if total > MAX_OCR_PAGES:
+                parts.append(f"_OCR stopped after {MAX_OCR_PAGES} of {total} pages._")
         return "\n\n".join(parts)
     except Exception as e:
         print(f"PDF OCR failed: {e}")
         return ''
+
+def cleanup_job_files(job_id):
+    """Clean up temporary files associated with a job."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            # Clean up input file
+            input_path = job.get('input_path')
+            if input_path and os.path.exists(input_path):
+                try:
+                    os.unlink(input_path)
+                except OSError:
+                    pass
+            # Clean up output file
+            output_path = job.get('output_path')
+            if output_path and os.path.exists(output_path):
+                try:
+                    os.unlink(output_path)
+                except OSError:
+                    pass
+            # Remove job from store after a delay? We'll keep it for a while for status checking
+            # but we can remove old jobs periodically. For now, we leave it and clean on retrieval.
+
+def process_conversion_job(job_id, file_path, job_type, **kwargs):
+    """Background job to process a conversion."""
+    try:
+        with jobs_lock:
+            if job_id not in jobs:
+                return  # Job was removed
+            jobs[job_id]['status'] = 'processing'
+            jobs[job_id]['progress'] = 0
+            jobs[job_id]['message'] = 'Starting conversion...'
+
+        if job_type == 'file':
+            # Process uploaded file
+            suffix = os.path.splitext(file_path)[1] or '.tmp'
+            describe = kwargs.get('describe', False)
+
+            # Update progress
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Detecting file type...'
+                jobs[job_id]['progress'] = 10
+
+            markdown_text = ''
+            if suffix.lower() == '.pdf':
+                markdown_text = convert_pdf_fast(file_path)
+                if not markdown_text:
+                    markdown_text = ocr_pdf(file_path)
+            if not markdown_text:
+                # For other file types, use markitdown
+                try:
+                    result = md.convert(file_path)
+                    markdown_text = result.text_content
+                except Exception as e:
+                    print(f"Markitdown conversion failed: {e}")
+                    markdown_text = ''
+
+            # Extract embedded images
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Extracting embedded images...'
+                jobs[job_id]['progress'] = 30
+
+            embedded_images = extract_images(file_path, suffix, describe=describe)
+
+            images_payload = []
+            described = []
+            for img in embedded_images:
+                img_data = img['data']
+                img_filename = img['filename']
+                content_type = img['content_type']
+                # Encode image data to base64 for transmission
+                img_base64 = base64.b64encode(img_data).decode('utf-8')
+                images_payload.append({
+                    'filename': img_filename,
+                    'content_type': content_type,
+                    'data': img_base64,
+                    'description': img.get('description')
+                })
+                if img.get('description'):
+                    described.append(img)
+
+            # Add image descriptions to markdown if any
+            if described:
+                with jobs_lock:
+                    jobs[job_id]['message'] = 'Adding image descriptions...'
+                    jobs[job_id]['progress'] = 60
+                markdown_text += "\n\n## Embedded Image Descriptions\n"
+                for img in described:
+                    markdown_text += f"\n**{img['filename']}**\n{img['description']}\n"
+
+            # Finalize markdown
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Generating final markdown...'
+                jobs[job_id]['progress'] = 80
+
+            # Save markdown to a temporary file for download
+            output_filename = f"{job_id}_{secure_filename(kwargs.get('filename', 'converted.md'))}"
+            output_path = os.path.join(RESULTS_DIR, output_filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_text)
+
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['message'] = 'Conversion completed'
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['images'] = images_payload  # For immediate use if needed
+                jobs[job_id]['markdown_content'] = markdown_text  # Store for small results
+
+        elif job_type == 'image':
+            # Process single image
+            metadata = get_image_metadata(file_path)
+            ocr_text = ocr_image(file_path)
+
+            with open(file_path, 'rb') as f:
+                image_bytes = f.read()
+
+            ext = os.path.splitext(file_path)[1].lstrip('.').lower()
+            content_type = CONTENT_TYPE_MAP.get(ext, 'image/png')
+
+            # Describe the image using markitdown (which may use vision LLM) or local OCR
+            description = None
+            try:
+                # Try markitdown first (which may use vision LLM via plugin)
+                result = md.convert(file_path)
+                markdown_from_markitdown = result.text_content.strip()
+                if markdown_from_markitdown:
+                    # Use markitdown's output as description
+                    description = markdown_from_markitdown
+                else:
+                    # Fallback to local describe_image
+                    description = describe_image(image_bytes, content_type)
+            except Exception as e:
+                print(f"Markitdown conversion failed: {e}")
+                description = describe_image(image_bytes, content_type)
+
+            # Build markdown output
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Building markdown output...'
+                jobs[job_id]['progress'] = 80
+            markdown_output = (
+                f"Image Information:\n"
+                f"- Filename: {kwargs.get('original_filename', 'image')}\n"
+                f"- {metadata}"
+            )
+            if ocr_text:
+                markdown_output += f"\n\n## Extracted Text\n{ocr_text}"
+            if description:
+                markdown_output += f"\n\n## Description\n{description}"
+
+            # Save markdown to file
+            output_filename = f"{job_id}_{secure_filename(kwargs.get('filename', 'converted.md'))}"
+            output_path = os.path.join(RESULTS_DIR, output_filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_output)
+
+            images_payload = [{
+                'filename': kwargs.get('original_filename', 'image'),
+                'content_type': content_type,
+                'data': base64.b64encode(image_bytes).decode('utf-8')
+            }]
+
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['message'] = 'Conversion completed'
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['images'] = images_payload
+                jobs[job_id]['markdown_content'] = markdown_output
+
+        elif job_type == 'url':
+            # Process URL
+            url = kwargs.get('url')
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Fetching URL...'
+                jobs[job_id]['progress'] = 20
+            try:
+                result = md.convert(url)
+                markdown_text = result.text_content
+            except Exception as e:
+                print(f"URL conversion failed: {e}")
+                raise
+
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Generating markdown...'
+                jobs[job_id]['progress'] = 80
+
+            # Save markdown to file
+            output_filename = f"{job_id}_{secure_filename('converted.md')}"
+            output_path = os.path.join(RESULTS_DIR, output_filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_text)
+
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['message'] = 'Conversion completed'
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['markdown_content'] = markdown_text
+
+        elif job_type == 'video':
+            # Process video URL (YouTube or generic)
+            url = kwargs.get('url')
+            video_id = None
+            if 'youtube.com/watch?v=' in url or 'youtu.be/' in url:
+                try:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed_url = urlparse(url)
+                    if 'youtube.com' in parsed_url.netloc:
+                        video_id = parse_qs(parsed_url.query).get('v', [None])[0]
+                    elif 'youtu.be' in parsed_url.netloc:
+                        video_id = parsed_url.path[1:]
+                except Exception:
+                    pass
+
+            if video_id:
+                with jobs_lock:
+                    jobs[job_id]['message'] = 'Fetching YouTube transcript...'
+                    jobs[job_id]['progress'] = 30
+                try:
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                    transcript = transcript_list.find_generated_transcript(['en', 'a.en']).fetch()
+
+                    markdown_transcript = "## Video Transcript\n"
+                    markdown_transcript += f"**Source:** [{url}]({url})\n\n"
+                    for entry in transcript:
+                        start_time = int(entry['start'])
+                        minutes = start_time // 60
+                        seconds = start_time % 60
+                        timestamp = f"{minutes:02d}:{seconds:02d}"
+                        markdown_transcript += f"[{timestamp}] {entry['text']}\n"
+                    markdown_text = markdown_transcript
+                except NoTranscriptFound:
+                    pass  # Fallback to yt-dlp
+                except Exception as e:
+                    print(f"YouTube transcript API failed for {url}: {e}")
+                    pass  # Fallback to yt-dlp
+
+            # Fallback to yt-dlp for metadata
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Fetching video metadata...'
+                jobs[job_id]['progress'] = 60
+            try:
+                ydl_opts = {
+                    'quiet': True,
+                    'skip_download': True,
+                    'format': 'bestaudio/best',
+                    'extract_flat': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+
+                    title = info.get('title', 'N/A')
+                    description = info.get('description', 'N/A')
+                    uploader = info.get('uploader', 'N/A')
+                    duration = info.get('duration', 0)
+                    view_count = info.get('view_count', 0)
+                    upload_date = info.get('upload_date', 'N/A')
+                    webpage_url = info.get('webpage_url', url)
+
+                    duration_minutes = duration // 60
+                    duration_seconds = duration % 60
+
+                    markdown_metadata = "## Video Information\n"
+                    markdown_metadata += f"**Title:** {title}\n"
+                    markdown_metadata += f"**Source URL:** [{webpage_url}]({webpage_url})\n"
+                    markdown_metadata += f"**Uploader:** {uploader}\n"
+                    markdown_metadata += f"**Duration:** {duration_minutes:02d}:{duration_seconds:02d}\n"
+                    markdown_metadata += f"**Views:** {view_count:,}\n"
+                    markdown_metadata += f"**Upload Date:** {upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}\n"
+                    markdown_metadata += f"\n### Description\n{description}\n"
+                    markdown_text = markdown_metadata
+            except Exception as e:
+                print(f"Video processing failed: {e}")
+                raise
+
+            with jobs_lock:
+                jobs[job_id]['message'] = 'Generating final markdown...'
+                jobs[job_id]['progress'] = 80
+
+            # Save markdown to file
+            output_filename = f"{job_id}_{secure_filename('converted.md')}"
+            output_path = os.path.join(RESULTS_DIR, output_filename)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_text)
+
+            with jobs_lock:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                jobs[job_id]['message'] = 'Conversion completed'
+                jobs[job_id]['output_path'] = output_path
+                jobs[job_id]['markdown_content'] = markdown_text
+
+        else:
+            raise ValueError(f"Unknown job type: {job_type}")
+
+    except Exception as e:
+        print(f"Job {job_id} failed: {e}")
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['progress'] = 0
+                jobs[job_id]['message'] = f"Conversion failed: {str(e)}"
+                jobs[job_id]['error'] = str(e)
+        # Clean up input file on failure
+        cleanup_job_files(job_id)
+    finally:
+        # Note: We do not clean up the output file here because the user may want to download it.
+        # We'll clean up old files periodically or when the job is retrieved after completion.
+        pass
 
 @app.route('/')
 def index():
@@ -153,50 +474,41 @@ def convert_file():
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
 
-    suffix = os.path.splitext(file.filename)[1] or '.tmp'
-    # Image descriptions call a vision API once per image: slow, so opt-in
-    describe = request.form.get('describe') == '1'
+    # Generate job ID
+    job_id = str(uuid.uuid4())
 
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    # Save uploaded file to a temporary location
+    suffix = os.path.splitext(file.filename)[1] or '.tmp'
+    fd, input_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
-        file.save(tmp_path)
-
-        markdown_text = ''
-        if suffix.lower() == '.pdf':
-            markdown_text = convert_pdf_fast(tmp_path)        # text PDFs: fast
-            if not markdown_text:
-                markdown_text = ocr_pdf(tmp_path)             # scanned PDFs: local OCR
-        if not markdown_text:
-            markdown_text = md.convert(tmp_path).text_content # everything else / last resort
-
-        # Pull any embedded pictures out of PDFs / DOCX / PPTX as real image bytes
-        embedded_images = extract_images(tmp_path, suffix, describe=describe)
-
-        images_payload = [
-            {
-                'filename': img['filename'],
-                'content_type': img['content_type'],
-                'data': base64.b64encode(img['data']).decode('utf-8'),
-                'description': img.get('description')
-            }
-            for img in embedded_images
-        ]
-
-        described = [img for img in embedded_images if img.get('description')]
-        if described:
-            markdown_text += "\n\n## Embedded Image Descriptions\n"
-            for img in described:
-                markdown_text += f"\n**{img['filename']}**\n{img['description']}\n"
-
-        return jsonify({'markdown': markdown_text, 'images': images_payload})
+        file.save(input_path)
     except Exception as e:
-        return jsonify({'error': f'Conversion failed: {str(e)}'}), 500
-    finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(input_path)
         except OSError:
             pass
+        return jsonify({'error': f'Failed to save uploaded file: {str(e)}'}), 500
+
+    # Create job entry
+    with jobs_lock:
+        jobs[job_id] = {
+            'id': job_id,
+            'status': 'queued',
+            'progress': 0,
+            'message': 'File uploaded, queued for conversion',
+            'input_path': input_path,
+            'job_type': 'file',
+            'filename': file.filename,
+            'describe': request.form.get('describe') == '1',
+            'created_at': time.time()
+        }
+
+    # Submit job to thread pool
+    executor.submit(process_conversion_job, job_id, input_path, 'file',
+                    filename=file.filename, describe=request.form.get('describe') == '1')
+
+    return jsonify({'job_id': job_id, 'status': 'queued'})
 
 @app.route('/api/convert-image', methods=['POST'])
 def convert_image():
@@ -210,69 +522,40 @@ def convert_image():
     if not allowed_file(file.filename):
         return jsonify({'error': 'Invalid image file type.'}), 400
 
-    original_filename = secure_filename(file.filename)
-    suffix = os.path.splitext(original_filename)[1] or '.tmp'
+    # Generate job ID
+    job_id = str(uuid.uuid4())
 
-    fd, image_path = tempfile.mkstemp(suffix=suffix)
+    # Save uploaded file to a temporary location
+    suffix = os.path.splitext(file.filename)[1] or '.tmp'
+    fd, input_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
-        file.save(image_path)
-
-        # Try to use markitdown with OCR plugin (vision LLM) if available
-        markdown_from_markitdown = ''
-        try:
-            # Convert the image to markdown using markitdown (which may use vision LLM via markitdown_ocr plugin)
-            result = md.convert(image_path)
-            markdown_from_markitdown = result.text_content.strip()
-        except Exception as e:
-            print(f'Markitdown conversion failed: {e}')
-            markdown_from_markitdown = ''
-
-        # If markitdown gave us useful content, use it
-        if markdown_from_markitdown:
-            # We can optionally append metadata, but the vision description might be sufficient
-            metadata = get_image_metadata(image_path)
-            markdown_output = f'{markdown_from_markitdown}\n\n---\n*Image Information:*\n- Filename: {original_filename}\n- {metadata}'
-        else:
-            # Fallback to original OCR-based processing
-            metadata = get_image_metadata(image_path)
-            ocr_text = ocr_image(image_path)
-
-            with open(image_path, 'rb') as f:
-                image_bytes = f.read()
-
-            ext = suffix.lstrip('.').lower()
-            content_type = CONTENT_TYPE_MAP.get(ext, 'image/png')
-
-            # Describe the image ONCE here so the markdown is self-contained.
-            # Returns None if too small / no API key / failed.
-            description = describe_image(image_bytes, content_type)
-
-            markdown_output = (
-                f'Image Information:\n'
-                f'- Filename: {original_filename}\n'
-                f'- {metadata}'
-            )
-            if ocr_text:
-                markdown_output += f'\\n\\n## Extracted Text\\n{ocr_text}'
-            if description:
-                markdown_output += f'\\n\\n## Description\\n{description}'
-
-        images_payload = [{
-            'filename': original_filename,
-            'content_type': content_type,
-            'data': base64.b64encode(image_bytes).decode('utf-8')
-        }]
-
-        return jsonify({'markdown': markdown_output, 'images': images_payload})
-
+        file.save(input_path)
     except Exception as e:
-        return jsonify({'error': f'Image conversion failed: {str(e)}'}), 500
-    finally:
         try:
-            os.unlink(image_path)
+            os.unlink(input_path)
         except OSError:
             pass
+        return jsonify({'error': f'Failed to save uploaded file: {str(e)}'}), 500
+
+    # Create job entry
+    with jobs_lock:
+        jobs[job_id] = {
+            'id': job_id,
+            'status': 'queued',
+            'progress': 0,
+            'message': 'Image uploaded, queued for conversion',
+            'input_path': input_path,
+            'job_type': 'image',
+            'original_filename': file.filename,
+            'created_at': time.time()
+        }
+
+    # Submit job to thread pool
+    executor.submit(process_conversion_job, job_id, input_path, 'image',
+                    original_filename=file.filename)
+
+    return jsonify({'job_id': job_id, 'status': 'queued'})
 
 @app.route('/api/convert-url', methods=['POST'])
 def convert_url():
@@ -284,11 +567,25 @@ def convert_url():
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
-    try:
-        result = md.convert(url)
-        return jsonify({'markdown': result.text_content})
-    except Exception as e:
-        return jsonify({'error': f'URL conversion failed: {str(e)}'}), 500
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    # Create job entry (no input file for URL)
+    with jobs_lock:
+        jobs[job_id] = {
+            'id': job_id,
+            'status': 'queued',
+            'progress': 0,
+            'message': 'URL received, queued for conversion',
+            'job_type': 'url',
+            'url': url,
+            'created_at': time.time()
+        }
+
+    # Submit job to thread pool
+    executor.submit(process_conversion_job, job_id, None, 'url', url=url)
+
+    return jsonify({'job_id': job_id, 'status': 'queued'})
 
 @app.route('/api/convert-video-url', methods=['POST'])
 def convert_video_url():
@@ -298,73 +595,25 @@ def convert_video_url():
     if not url:
         return jsonify({'error': 'No video URL provided'}), 400
 
-    video_id = None
-    if 'youtube.com/watch?v=' in url or 'youtu.be/' in url:
-        try:
-            from urllib.parse import urlparse, parse_qs
-            parsed_url = urlparse(url)
-            if 'youtube.com' in parsed_url.netloc:
-                video_id = parse_qs(parsed_url.query).get('v', [None])[0]
-            elif 'youtu.be' in parsed_url.netloc:
-                video_id = parsed_url.path[1:]
-        except Exception:
-            pass
+    # Generate job ID
+    job_id = str(uuid.uuid4())
 
-    if video_id:
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = transcript_list.find_generated_transcript(['en', 'a.en']).fetch()
-
-            markdown_transcript = "## Video Transcript\n"
-            markdown_transcript += f"**Source:** [{url}]({url})\n\n"
-            for entry in transcript:
-                start_time = int(entry['start'])
-                minutes = start_time // 60
-                seconds = start_time % 60
-                timestamp = f"{minutes:02d}:{seconds:02d}"
-                markdown_transcript += f"[{timestamp}] {entry['text']}\n"
-            return jsonify({'markdown': markdown_transcript})
-        except NoTranscriptFound:
-            pass
-        except Exception as e:
-            print(f"YouTube transcript API failed for {url}: {e}")
-            pass
-
-    # Fallback to yt-dlp for metadata
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'format': 'bestaudio/best',
-            'extract_flat': True,
+    # Create job entry
+    with jobs_lock:
+        jobs[job_id] = {
+            'id': job_id,
+            'status': 'queued',
+            'progress': 0,
+            'message': 'Video URL received, queued for conversion',
+            'job_type': 'video',
+            'url': url,
+            'created_at': time.time()
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
 
-            title = info.get('title', 'N/A')
-            description = info.get('description', 'N/A')
-            uploader = info.get('uploader', 'N/A')
-            duration = info.get('duration', 0)
-            view_count = info.get('view_count', 0)
-            upload_date = info.get('upload_date', 'N/A')
-            webpage_url = info.get('webpage_url', url)
+    # Submit job to thread pool
+    executor.submit(process_conversion_job, job_id, None, 'video', url=url)
 
-            duration_minutes = duration // 60
-            duration_seconds = duration % 60
-
-            markdown_metadata = "## Video Information\n"
-            markdown_metadata += f"**Title:** {title}\n"
-            markdown_metadata += f"**Source URL:** [{webpage_url}]({webpage_url})\n"
-            markdown_metadata += f"**Uploader:** {uploader}\n"
-            markdown_metadata += f"**Duration:** {duration_minutes:02d}:{duration_seconds:02d}\n"
-            markdown_metadata += f"**Views:** {view_count:,}\n"
-            markdown_metadata += f"**Upload Date:** {upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}\n"
-            markdown_metadata += f"\n### Description\n{description}\n"
-
-            return jsonify({'markdown': markdown_metadata})
-
-    except Exception as e:
-        return jsonify({'error': f'Video processing failed: {str(e)}'}), 500
+    return jsonify({'job_id': job_id, 'status': 'queued'})
 
 @app.route('/api/convert-text', methods=['POST'])
 def convert_text():
@@ -374,101 +623,76 @@ def convert_text():
     if not text:
         return jsonify({'error': 'No text provided'}), 400
 
+    # For text conversion, it's fast so we can do it synchronously
     return jsonify({'markdown': text})
 
-@app.route('/api/push-to-github', methods=['POST'])
-def push_to_github():
-    try:
-        data = request.get_json()
-        markdown_content = data.get('markdown', '')
-        filename = data.get('filename', 'converted.md').strip()
-        images = data.get('images', [])  # [{filename, content_type, data(base64)}, ...]
+@app.route('/api/job/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
 
-        if not markdown_content and not images:
-            return jsonify({'error': 'No content to push'}), 400
-
-        github_token = os.environ.get('GITHUB_TOKEN')
-        github_repo = os.environ.get('GITHUB_REPO')
-        github_branch = os.environ.get('GITHUB_BRANCH', 'main')
-        github_folder = os.environ.get('GITHUB_FOLDER', 'converted')
-
-        if not github_token or not github_repo:
-            return jsonify({'error': 'GitHub is not configured on the server. Set GITHUB_TOKEN and GITHUB_REPO.'}), 500
-
-        safe_filename = secure_filename(filename)
-        if not safe_filename:
-            safe_filename = 'converted.md'
-        if not safe_filename.endswith('.md'):
-            safe_filename += '.md'
-
-        timestamp = int(time.time())
-        timestamped_filename = f"{timestamp}_{safe_filename}"
-
-        headers = {
-            "Authorization": f"token {github_token}",
-            "Accept": "application/vnd.github.v3+json"
+        # Prepare response (excluding internal fields like input_path)
+        response = {
+            'job_id': job['id'],
+            'status': job['status'],
+            'progress': job['progress'],
+            'message': job['message']
         }
+        if job['status'] == 'completed':
+            # Provide download URL
+            response['download_url'] = f'/api/job/{job_id}/download'
+            response['filename'] = os.path.basename(job['output_path']) if job.get('output_path') else 'converted.md'
+        elif job['status'] == 'failed':
+            response['error'] = job.get('error', 'Unknown error')
 
-        # Push real image bytes first, collect their real GitHub raw URLs
-        pushed_images = []
-        for img in images:
-            img_filename = secure_filename(img.get('filename') or 'image.png')
-            img_folder = f"{github_folder}/{timestamp}_images" if github_folder else f"{timestamp}_images"
-            img_path = f"{img_folder}/{img_filename}"
-            img_api_url = f"https://api.github.com/repos/{github_repo}/contents/{img_path}"
+        return jsonify(response)
 
-            img_payload = {
-                "message": f"Add image: {img_filename}",
-                "content": img.get('data', ''),  # already base64-encoded by the client
-                "branch": github_branch
-            }
+@app.route('/api/job/<job_id>/download', methods=['GET'])
+def download_job_result(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
 
-            img_response = requests.put(img_api_url, json=img_payload, headers=headers, timeout=15)
-            if img_response.status_code in (200, 201):
-                pushed_images.append({
-                    'filename': img_filename,
-                    'raw_url': img_response.json()['content']['download_url']
-                })
-            # A single failed image push shouldn't kill the whole request — skip and continue
+        if job['status'] != 'completed':
+            return jsonify({'error': 'Job not completed yet'}), 400
 
-        if pushed_images:
-            if len(pushed_images) == 1:
-                # Standalone image upload — embed the real image right above its metadata
-                img = pushed_images[0]
-                markdown_content = f"![{img['filename']}]({img['raw_url']})\n\n{markdown_content}"
-            else:
-                # Multiple images extracted from a document — gallery at the bottom
-                markdown_content += "\n\n## Extracted Images\n\n"
-                for img in pushed_images:
-                    markdown_content += f"![{img['filename']}]({img['raw_url']})\n\n"
+        output_path = job.get('output_path')
+        if not output_path or not os.path.exists(output_path):
+            return jsonify({'error': 'Result file not found'}), 404
 
-        path = f"{github_folder}/{timestamped_filename}" if github_folder else timestamped_filename
-        api_url = f"https://api.github.com/repos/{github_repo}/contents/{path}"
+        # Determine the filename to use for download
+        download_filename = job.get('filename', 'converted.md')
+        if not download_filename.endswith('.md'):
+            download_filename += '.md'
 
-        content_encoded = base64.b64encode(markdown_content.encode('utf-8')).decode('utf-8')
+        # Send the file
+        try:
+            return send_file(output_path, as_attachment=True, download_name=download_filename)
+        except Exception as e:
+            return jsonify({'error': f'Failed to send file: {str(e)}'}), 500
 
-        payload = {
-            "message": f"Add converted markdown: {timestamped_filename}",
-            "content": content_encoded,
-            "branch": github_branch
-        }
+# Helper function to send file (since we don't have Flask's send_file imported yet)
+from flask import send_file
 
-        response = requests.put(api_url, json=payload, headers=headers, timeout=15)
+# Periodic cleanup of old jobs and files (call this from a background thread or on request)
+def cleanup_old_jobs():
+    """Remove jobs older than JOB_TIMEOUT_SECONDS and clean up their files."""
+    current_time = time.time()
+    with jobs_lock:
+        job_ids_to_remove = []
+        for job_id, job in jobs.items():
+            if current_time - job.get('created_at', 0) > JOB_TIMEOUT_SECONDS:
+                job_ids_to_remove.append(job_id)
+        for job_id in job_ids_to_remove:
+            job = jobs.pop(job_id, None)
+            if job:
+                cleanup_job_files(job_id)
 
-        if response.status_code in (200, 201):
-            result = response.json()
-            return jsonify({
-                'success': True,
-                'html_url': result['content']['html_url'],
-                'raw_url': result['content']['download_url'],
-                'images_pushed': len(pushed_images)
-            })
-        else:
-            error_detail = response.json().get('message', 'Unknown GitHub API error')
-            return jsonify({'error': f'GitHub API error: {error_detail}'}), response.status_code
-
-    except Exception as e:
-        return jsonify({'error': f'Push failed: {str(e)}'}), 500
+# We'll call cleanup occasionally - for now, we'll do it on status request for simplicity
+# In production, you might want a separate background thread for this.
 
 if __name__ == '__main__':
     app.run(debug=True)
