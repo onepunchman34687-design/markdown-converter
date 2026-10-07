@@ -13,4 +13,3 @@ yt-dlp>=2024.1.0
 markitdown-ocr
 pytesseract
 pymupdf4llm
-rapidocr-onnxruntime

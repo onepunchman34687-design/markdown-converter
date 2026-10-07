@@ -1,0 +1,5 @@
+converted/
+__pycache__/
+.env
+.git
+.claude/
