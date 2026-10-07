@@ -1,2 +1,1 @@
-Set-Content -Path runtime.txt -Value "python-3.11.9" -Encoding ascii
-type runtime.txt
+python-3.11.9
