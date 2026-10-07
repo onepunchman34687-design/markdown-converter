@@ -20,7 +20,7 @@ def _is_too_small(image_bytes):
         return False  # if we can't even open it, let describe_image() decide
 
 
-def extract_images(file_path, suffix):
+def extract_images(file_path, suffix, describe=True):
     """
     Dispatches to the right extractor based on file extension.
     Returns a list of dicts:
@@ -42,6 +42,9 @@ def extract_images(file_path, suffix):
         return []
 
     for img in images:
+	if not describe:
+            img['description'] = None
+            continue
         if _is_too_small(img['data']):
             img['description'] = None
             continue
