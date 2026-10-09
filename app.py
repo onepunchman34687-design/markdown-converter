@@ -32,21 +32,12 @@ load_dotenv()
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
 md = MarkItDown()
-
-# Optional plugin: don't crash the whole app if it is missing or misconfigured
-try:
-    from markitdown_ocr import register_converters
-    register_converters(md)
-except Exception as e:
-    print(f"markitdown_ocr not registered: {e}")
-
 # Windows: find Tesseract even if it is not on PATH
 _WIN_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if pytesseract and not shutil.which("tesseract") and os.path.exists(_WIN_TESSERACT):
     pytesseract.pytesseract.tesseract_cmd = _WIN_TESSERACT
 
 MAX_OCR_PAGES = int(os.environ.get('MAX_OCR_PAGES', '30'))
-_rapid_engine = None
 
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
@@ -80,8 +71,7 @@ def get_image_metadata(file_path):
 # ---------------------------------------------------------------- OCR helpers
 
 def _ocr_pil(img):
-    """OCR a PIL image. Tries Tesseract first, then RapidOCR. Returns '' if neither works."""
-    global _rapid_engine
+    """OCR a PIL image. Uses Tesseract if available, otherwise returns empty string."""
     img = ImageOps.exif_transpose(img)
     img = ImageOps.grayscale(img)
     if img.width < 1500:
@@ -91,18 +81,9 @@ def _ocr_pil(img):
         try:
             return pytesseract.image_to_string(img, config="--psm 6").strip()
         except Exception as e:
-            print(f"Tesseract OCR failed, trying RapidOCR: {e}")
-
-    try:
-        import numpy as np
-        from rapidocr_onnxruntime import RapidOCR
-        if _rapid_engine is None:
-            _rapid_engine = RapidOCR()
-        result, _ = _rapid_engine(np.array(img))
-        return "\n".join(line[1] for line in result) if result else ""
-    except Exception as e:
-        print(f"RapidOCR failed: {e}")
-        return ""
+            print(f"Tesseract OCR failed: {e}")
+            return ""
+    return ""
 
 def ocr_image(path):
     try:
@@ -320,35 +301,6 @@ def process_conversion_job(job_id, file_path, job_type, **kwargs):
                 jobs[job_id]['images'] = images_payload
                 jobs[job_id]['markdown_content'] = markdown_output
 
-        elif job_type == 'url':
-            # Process URL
-            url = kwargs.get('url')
-            with jobs_lock:
-                jobs[job_id]['message'] = 'Fetching URL...'
-                jobs[job_id]['progress'] = 20
-            try:
-                result = md.convert(url)
-                markdown_text = result.text_content
-            except Exception as e:
-                print(f"URL conversion failed: {e}")
-                raise
-
-            with jobs_lock:
-                jobs[job_id]['message'] = 'Generating markdown...'
-                jobs[job_id]['progress'] = 80
-
-            # Save markdown to file
-            output_filename = f"{job_id}_{secure_filename('converted.md')}"
-            output_path = os.path.join(RESULTS_DIR, output_filename)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(markdown_text)
-
-            with jobs_lock:
-                jobs[job_id]['status'] = 'completed'
-                jobs[job_id]['progress'] = 100
-                jobs[job_id]['message'] = 'Conversion completed'
-                jobs[job_id]['output_path'] = output_path
-                jobs[job_id]['markdown_content'] = markdown_text
 
         elif job_type == 'video':
             # Process video URL (YouTube or generic)
@@ -557,35 +509,6 @@ def convert_image():
 
     return jsonify({'job_id': job_id, 'status': 'queued'})
 
-@app.route('/api/convert-url', methods=['POST'])
-def convert_url():
-    data = request.get_json()
-    url = data.get('url', '').strip()
-
-    if not url:
-        return jsonify({'error': 'No URL provided'}), 400
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-
-    # Generate job ID
-    job_id = str(uuid.uuid4())
-
-    # Create job entry (no input file for URL)
-    with jobs_lock:
-        jobs[job_id] = {
-            'id': job_id,
-            'status': 'queued',
-            'progress': 0,
-            'message': 'URL received, queued for conversion',
-            'job_type': 'url',
-            'url': url,
-            'created_at': time.time()
-        }
-
-    # Submit job to thread pool
-    executor.submit(process_conversion_job, job_id, None, 'url', url=url)
-
-    return jsonify({'job_id': job_id, 'status': 'queued'})
 
 @app.route('/api/convert-video-url', methods=['POST'])
 def convert_video_url():
@@ -615,16 +538,6 @@ def convert_video_url():
 
     return jsonify({'job_id': job_id, 'status': 'queued'})
 
-@app.route('/api/convert-text', methods=['POST'])
-def convert_text():
-    data = request.get_json()
-    text = data.get('text', '').strip()
-
-    if not text:
-        return jsonify({'error': 'No text provided'}), 400
-
-    # For text conversion, it's fast so we can do it synchronously
-    return jsonify({'markdown': text})
 
 @app.route('/api/job/<job_id>', methods=['GET'])
 def get_job_status(job_id):

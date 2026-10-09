@@ -46,9 +46,7 @@
             <span class="pill">DOCX</span>
             <span class="pill">PPTX</span>
             <span class="pill">Images</span>
-            <span class="pill">URLs</span>
             <span class="pill">YouTube</span>
-            <span class="pill">Plain text</span>
         </div>
     </div>
 </section>
@@ -62,7 +60,7 @@
 
             <div class="slide-label-row">
                 <span class="slide-label" id="slideLabel">Upload a file</span>
-                <span class="slide-counter"><span id="slideNum">1</span> / 4</span>
+                <span class="slide-counter"><span id="slideNum">1</span> / 3</span>
             </div>
 
             <!-- Slides wrapper -->
@@ -105,20 +103,12 @@
                 <!-- Slide 3: URL -->
                 <div class="slide" id="slide-2">
                     <div class="url-slide">
-                        <p class="slide-hint">Paste any URL — article, Wikipedia page, YouTube link…</p>
-                        <input type="text" id="urlInput" class="text-input" placeholder="https://en.wikipedia.org/wiki/…">
-                        <button class="convert-btn" id="convertUrlBtn">Convert URL</button>
+                        <p class="slide-hint">Paste a YouTube or video URL</p>
+                        <input type="text" id="urlInput" class="text-input" placeholder="https://www.youtube.com/watch?v=…">
+                        <button class="convert-btn" id="convertUrlBtn">Convert Video URL</button>
                     </div>
                 </div>
 
-                <!-- Slide 4: Text -->
-                <div class="slide" id="slide-3">
-                    <div class="text-slide">
-                        <p class="slide-hint">Paste raw text — Claude will clean and structure it as markdown.</p>
-                        <textarea id="textInput" class="text-area" placeholder="Paste your text here…"></textarea>
-                        <button class="convert-btn" id="convertTextBtn">Convert Text</button>
-                    </div>
-                </div>
 
             </div>
 
@@ -129,7 +119,6 @@
                     <button class="dot active" data-idx="0"></button>
                     <button class="dot" data-idx="1"></button>
                     <button class="dot" data-idx="2"></button>
-                    <button class="dot" data-idx="3"></button>
                 </div>
                 <button class="nav-arrow" id="nextBtn" aria-label="Next">&#8594;</button>
             </div>

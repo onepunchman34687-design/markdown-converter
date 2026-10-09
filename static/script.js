@@ -1,6 +1,6 @@
 /* ─── STATE ──────────────────────────────────────── */
 let currentSlide = 0;
-const SLIDES = ['Upload a non-image file', 'Upload an image', 'Convert URL', 'Convert text'];
+const SLIDES = ['Upload a non-image file', 'Upload an image', 'Convert YouTube URL'];
 let currentMarkdown = '';
 let currentImages = [];
 
@@ -23,9 +23,7 @@ const fileInput      = document.getElementById('fileInput');
 const imageDropZone  = document.getElementById('imageDropZone');
 const imageFileInput = document.getElementById('imageFileInput');
 const urlInput       = document.getElementById('urlInput');
-const textInput      = document.getElementById('textInput');
 const convertUrlBtn  = document.getElementById('convertUrlBtn');
-const convertTextBtn = document.getElementById('convertTextBtn');
 
 const markdownOutput = document.getElementById('markdownOutput');
 const copyBtn        = document.getElementById('copyBtn');
@@ -255,28 +253,6 @@ convertUrlBtn.addEventListener('click', async () => {
     }
 });
 
-/* ─── CONVERT: TEXT ──────────────────────────────── */
-convertTextBtn.addEventListener('click', async () => {
-    const text = textInput.value.trim();
-    if (!text) { showError('Paste some text first.'); return; }
-
-    clearMessages();
-    showStatus('Processing text…');
-
-    try {
-        const res  = await fetch('/api/convert-text', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text })
-        });
-        const data = await res.json();
-        if (!res.ok) { showError(data.error || 'Processing failed'); return; }
-        setOutput(data.markdown, null, []);
-        clearMessages();
-    } catch (err) {
-        showError('Request failed: ' + err.message);
-    }
-});
 
 /* ─── OUTPUT ─────────────────────────────────────── */
 function setOutput(md, sourceName, images) {
@@ -371,7 +347,6 @@ clearBtn.addEventListener('click', () => {
     fileInput.value      = '';
     imageFileInput.value = '';
     urlInput.value       = '';
-    textInput.value      = '';
     filenameInput.value  = 'converted.md';
     githubUrlOutput.value = '';
     [copyBtn, downloadBtn, githubBtn, clearBtn].forEach(b => b.style.display = 'none');
