@@ -52,6 +52,7 @@ themeToggle.addEventListener('click', () => {
     localStorage.setItem('theme', next);
 });
 
+/* ─── PAGE NAV ───────────────────────────────────── */
 function navigatePage(fromEl, toEl, direction = 1) {
     // Ensure both are visible for transition
     fromEl.classList.add('active');
@@ -72,12 +73,12 @@ function navigatePage(fromEl, toEl, direction = 1) {
 
     // Wait for transition end
     setTimeout(() => {
-        fromEl.classList.remove('active', 'exit-left', 'exit-right');
-        toEl.classList.remove('enter-left', 'enter-right');
+        fromEl.classList.remove('active');
+        fromEl.classList.remove(direction > 0 ? 'exit-left' : 'exit-right');
+        toEl.classList.remove(direction > 0 ? 'enter-right' : 'enter-left');
     }, 500);
 }
 
-/* ─── PAGE NAV ───────────────────────────────────── */
 startBtn.addEventListener('click', () => {
     navigatePage(landingPage, converterPage, 1); // forward
 });
@@ -186,13 +187,17 @@ async function handleFileUpload(file) {
         const data = await res.json();
         if (!res.ok) { showError(data.error || 'Conversion failed'); return; }
         setOutput(data.markdown, file.name, data.images || []);
-        if (currentImages.length > 0) {
-            showStatus(`Converted — found ${currentImages.length} embedded image(s). They'll upload alongside the markdown when you push to GitHub.`);
+        if (data.images.length > 0) {
+            showStatus(`Converted — found ${data.images.length} embedded image(s). They'll upload alongside the markdown when you push to GitHub.`);
         } else {
             clearMessages();
         }
     } catch (err) {
-        showError('Upload failed: ' + err.message);
+        if (err instanceof SyntaxError) {
+            showError('Server returned invalid response. Please check the server logs.');
+        } else {
+            showError('Upload failed: ' + err.message);
+        }
     }
 }
 
@@ -205,13 +210,17 @@ async function handleImageUpload(file) {
     formData.append('file', file);
 
     try {
-        const res  = await fetch('/api/convert-image', { method: 'POST', body: formData });
+        const res = await fetch('/api/convert-image', { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) { showError(data.error || 'Image conversion failed'); return; }
         setOutput(data.markdown, file.name, data.images || []);
         showStatus('Ready — click "Push to GitHub" to upload the actual image and get its live URL.');
     } catch (err) {
-        showError('Image upload failed: ' + err.message);
+        if (err instanceof SyntaxError) {
+            showError('Server returned invalid response. Please check the server logs.');
+        } else {
+            showError('Image upload failed: ' + err.message);
+        }
     }
 }
 
@@ -229,27 +238,30 @@ convertUrlBtn.addEventListener('click', async () => {
     const url = urlInput.value.trim();
     if (!url) { showError('Paste a URL first.'); return; }
 
-    clearMessages();
-    showStatus('Fetching and converting…');
-
-    let apiUrl = '/api/convert-url';
-    if (isVideoUrl(url)) {
-        apiUrl = '/api/convert-video-url';
-        showStatus('Fetching video transcript and converting…');
+    if (!isVideoUrl(url)) {
+        showError('Only YouTube, Vimeo, Dailymotion, and Twitch URLs are supported.');
+        return;
     }
 
+    clearMessages();
+    showStatus('Fetching video transcript and converting…');
+
     try {
-        const res  = await fetch(apiUrl, {
+        const res = await fetch('/api/convert-video-url', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url })
         });
         const data = await res.json();
         if (!res.ok) { showError(data.error || 'Conversion failed'); return; }
-        setOutput(data.markdown, null, []);
+        setOutput(data.markdown, null, data.images || []);
         clearMessages();
     } catch (err) {
-        showError('Request failed: ' + err.message);
+        if (err instanceof SyntaxError) {
+            showError('Server returned invalid response. Please check the server logs.');
+        } else {
+            showError('Request failed: ' + err.message);
+        }
     }
 });
 
@@ -324,7 +336,11 @@ githubBtn.addEventListener('click', async () => {
             ? `Pushed to GitHub ✓ (${data.images_pushed} real image(s) included — open the URL to see it)`
             : 'Pushed to GitHub ✓');
     } catch (err) {
-        showError('Push failed: ' + err.message);
+        if (err instanceof SyntaxError) {
+            showError('Server returned invalid response. Please check the server logs.');
+        } else {
+            showError('Push failed: ' + err.message);
+        }
     }
 });
 
